@@ -624,7 +624,7 @@ async fn handle_message(&self, msg: Message) -> Result<()> {
             match dialogs.next().await? {
                 Some(dialog) => {
                     if dialog.chat().id() == id {
-                        return Ok(dialog.chat());
+                        return Ok(dialog.chat().clone());
                     }
                 }
                 None => break,
