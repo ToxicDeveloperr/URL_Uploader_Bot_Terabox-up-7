@@ -426,15 +426,15 @@ impl Bot {
         info!("Uploaded file {} ({} bytes) in {}", name, length, elapsed);
 
         // Send file
-        let mut input_msg = InputMessage::html(format!(
+        let caption = format!(
             "Uploaded in <b>{:.2} secs</b>",
             elapsed.num_milliseconds() as f64 / 1000.0
-        ));
-        if is_video {
-            input_msg = input_msg.video(file).caption(input_msg.text().to_string());
+        );
+        let input_msg = if is_video {
+            InputMessage::video(file).caption(caption)
         } else {
-            input_msg = input_msg.document(file);
-        }
+            InputMessage::document(file).caption(caption)
+        };
         msg.reply(input_msg).await?;
 
         // Delete status message
