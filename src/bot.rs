@@ -425,27 +425,22 @@ impl Bot {
             "Uploaded in <b>{:.2} secs</b>",
             elapsed.num_milliseconds() as f64 / 1000.0
         ));
-        
+        input_msg = input_msg.document(file);
         if is_video {
-            input_msg = input_msg.video(file);
             input_msg = input_msg.attribute(grammers_client::types::Attribute::Video {
                 supports_streaming: true,
-                duration: Duration::from_secs(0), // optional: actual duration
-                w: 1280,
-                h: 720,
+                duration: Duration::ZERO,
+                w: 0,
+                h: 0,
                 round_message: false,
             });
-        } else {
-            input_msg = input_msg.document(file);
         }
-        
         msg.reply(input_msg).await?;
-        
+
         // Delete status message
         status.lock().await.delete().await?;
-        
-        Ok(())
 
+        Ok(())
     }
 
     /// Callback query handler.
