@@ -616,6 +616,9 @@ async fn handle_message(&self, msg: Message) -> Result<()> {
 
     // Worker: process queued URLs and upload one-by-one to the destination channel
     async fn queue_worker(self: Arc<Self>, mut rx: mpsc::Receiver<String>) -> Result<()> {
+        // Keep a cached destination chat once resolved
+        let mut cached_dest: Option<Chat> = None;
+
         loop {
             let Some(url_str) = rx.recv().await else { break; };
 
@@ -627,11 +630,31 @@ async fn handle_message(&self, msg: Message) -> Result<()> {
                 }
             };
 
-            // Resolve destination Chat by scanning dialogs once per task (cheap enough)
-            let dest_chat = self
-                .resolve_chat_by_id(dest_id)
-                .await
-                .with_context(|| format!("Failed to resolve destination chat id {}", dest_id))?;
+            // Ensure dest chat is resolved; retry until available so we don't lose queued items
+            if cached_dest.as_ref().map(|c| c.id()) != Some(dest_id) {
+                cached_dest = None;
+            }
+            let dest_chat = match &cached_dest {
+                Some(c) => c.clone(),
+                None => {
+                    loop {
+                        match self.resolve_chat_by_id(dest_id).await {
+                            Ok(c) => {
+                                info!("Destination chat resolved: {}", dest_id);
+                                cached_dest = Some(c.clone());
+                                break c;
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Destination chat id {} not resolvable: {}. Ensure the bot is a member/admin. Retrying in 10s...",
+                                    dest_id, e
+                                );
+                                tokio::time::sleep(Duration::from_secs(10)).await;
+                            }
+                        }
+                    }
+                }
+            };
 
             let url = match Url::parse(&url_str) {
                 Ok(u) => u,
