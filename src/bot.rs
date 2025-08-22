@@ -30,12 +30,18 @@ pub struct Bot {
     started_by: Arc<DashMap<i64, i64>>,
     triggers: Arc<DashMap<i64, Trigger>>,
 
+    // Cache known chats we have seen in updates (id -> Chat)
+    known_chats: Arc<DashMap<i64, Chat>>,
+
     // Queue for source-channel links
     queue_tx: mpsc::Sender<String>,
 
     // Configured source/destination (by id)
     source_channel_id: Option<i64>,
     destination_channel_id: Option<i64>,
+
+    // Optional destination username for resolution (e.g., @mychannel without @)
+    destination_channel_username: Option<String>,
 }
 
 // Very simple URL extractor: splits by whitespace and keeps http(s) tokens,
@@ -81,6 +87,8 @@ pub async fn new(client: Client) -> Result<Arc<Self>> {
 
         let (queue_tx, queue_rx) = mpsc::channel::<String>(200);
 
+        let dest_username = std::env::var("DESTINATION_CHANNEL_USERNAME").ok().map(|s| s.trim_start_matches('@').to_string());
+
         let bot = Arc::new(Self {
             client,
             me,
@@ -91,9 +99,11 @@ pub async fn new(client: Client) -> Result<Arc<Self>> {
             locks: Arc::new(DashSet::new()),
             started_by: Arc::new(DashMap::new()),
             triggers: Arc::new(DashMap::new()),
+            known_chats: Arc::new(DashMap::new()),
             queue_tx,
             source_channel_id,
             destination_channel_id,
+            destination_channel_username: dest_username,
         });
 
         // Spawn queue worker if both ids are configured
@@ -207,6 +217,9 @@ pub async fn new(client: Client) -> Result<Arc<Self>> {
     /// If the command is not recognized, it will try to parse the message as a URL.
 async fn handle_message(&self, msg: Message) -> Result<()> {
         // Basic visibility: log every new message with chat kind
+        // Cache the chat so we can send messages later without dialogs
+        self.known_chats.insert(msg.chat().id(), msg.chat().clone());
+
         let kind = match msg.chat() {
             Chat::User(_) => "user",
             Chat::Group(_) => "group",
@@ -638,7 +651,7 @@ async fn handle_message(&self, msg: Message) -> Result<()> {
                 Some(c) => c.clone(),
                 None => {
                     loop {
-                        match self.resolve_chat_by_id(dest_id).await {
+                        match self.get_or_wait_chat(dest_id).await {
                             Ok(c) => {
                                 info!("Destination chat resolved: {}", dest_id);
                                 cached_dest = Some(c.clone());
@@ -671,23 +684,52 @@ async fn handle_message(&self, msg: Message) -> Result<()> {
         Ok(())
     }
 
-    // Resolve a chat by id from bot's dialogs
-    async fn resolve_chat_by_id(&self, id: i64) -> Result<Chat> {
-        let mut dialogs = self.client.iter_dialogs();
-        loop {
-            match dialogs.next().await? {
-                Some(dialog) => {
-                    if dialog.chat().id() == id {
-                        return Ok(dialog.chat().clone());
+    // Try to get a chat by id from cache or by resolving username, without using dialogs (bots can't use getDialogs)
+    async fn get_or_wait_chat(&self, id: i64) -> Result<Chat> {
+        // First, check cache from updates
+        if let Some(chat) = self.known_chats.get(&id) {
+            return Ok(chat.clone());
+        }
+
+        // Second, try resolving by username if provided
+        if let Some(username) = &self.destination_channel_username {
+            match self.client.resolve_username(username).await? {
+                Some(resolved) => {
+                    match resolved {
+                        grammers_client::types::UsernameResolution::User(_) => {
+                            anyhow::bail!("Resolved username @{} to a user, not a channel/group", username)
+                        }
+                        grammers_client::types::UsernameResolution::Chat(chat) => {
+                            // Cache and return if ids match or if we don't care about id strictly
+                            self.known_chats.insert(chat.id(), chat.clone());
+                            if chat.id() != id {
+                                warn!(
+                                    "Resolved @{} to chat id {}, but DESTINATION_CHANNEL_ID is {}. Using resolved chat.",
+                                    username, chat.id(), id
+                                );
+                            }
+                            return Ok(chat);
+                        }
                     }
                 }
-                None => break,
+                None => {
+                    warn!("Could not resolve username @{} yet", username);
+                }
             }
         }
-        anyhow::bail!(
-            "Chat id {} not found in dialogs. Ensure the bot is a member/admin.",
-            id
-        )
+
+        // Finally, wait until an update for this chat arrives (bot must be member/admin)
+        // We poll the cache for up to 5 minutes with 5s interval
+        let mut waited = 0u64;
+        while waited < 300 {
+            if let Some(chat) = self.known_chats.get(&id) {
+                return Ok(chat.clone());
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            waited += 5;
+        }
+
+        anyhow::bail!("Chat id {} not available yet. Ensure the bot is a member and has posted/seen at least one event.", id)
     }
 
     // Core upload logic reused by queue worker (progress messages are posted in dest chat)
