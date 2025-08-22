@@ -66,39 +66,27 @@ impl Bot {
 
     /// Get final stream link for Terabox URLs
     async fn get_final_stream_link(&self, terabox_url: &str) -> Result<Option<String>> {
-        let api_url = "https://teradl.in/api/teradl.php";
-        
+        let api_url = "https://vercel-api-2-ecru.vercel.app/fetch";
+    
         let response = self.http
             .get(api_url)
             .query(&[("url", terabox_url)])
-            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
-            .header("Accept", "*/*")
-            .header("Referer", "https://teradl.in/")
-            .header("Accept-Encoding", "gzip, deflate, br, zstd")
-            .header("Accept-Language", "en-US,en;q=0.5")
-            .header("Sec-Fetch-Site", "same-origin")
-            .header("Sec-Fetch-Mode", "cors")
-            .header("Sec-Fetch-Dest", "empty")
-            .header("Sec-GPC", "1")
             .send()
             .await?;
-
+    
         if response.status().is_success() {
             let data: Value = response.json().await?;
-            
-            if let Some(success) = data.get("success") {
-                if success.as_bool().unwrap_or(false) {
-                    if let Some(proxy_url) = data.get("proxy_url") {
-                        if let Some(url_str) = proxy_url.as_str() {
-                            return Ok(Some(url_str.to_string()));
-                        }
-                    }
+    
+            if let Some(proxy_url) = data.get("proxy_url") {
+                if let Some(url_str) = proxy_url.as_str() {
+                    return Ok(Some(url_str.to_string()));
                 }
             }
         }
-
+    
         Ok(None)
     }
+
 
     /// Run the bot.
     pub async fn run(self: Arc<Self>) {
