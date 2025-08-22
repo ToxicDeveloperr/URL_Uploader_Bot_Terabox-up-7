@@ -75,12 +75,19 @@ impl Bot {
             .await?;
     
         if response.status().is_success() {
-            let data: Value = response.json().await?;
+            let text = response.text().await?;
+            // Debug ke liye
+            println!("Raw API response: {}", text);
     
-            if let Some(proxy_url) = data.get("proxy_url") {
-                if let Some(url_str) = proxy_url.as_str() {
-                    return Ok(Some(url_str.to_string()));
+            // JSON parse karne ki try
+            if let Ok(data) = serde_json::from_str::<Value>(&text) {
+                if let Some(proxy_url) = data.get("proxy_url") {
+                    if let Some(url_str) = proxy_url.as_str() {
+                        return Ok(Some(url_str.to_string()));
+                    }
                 }
+            } else {
+                eprintln!("Failed to parse JSON from API response");
             }
         }
     
