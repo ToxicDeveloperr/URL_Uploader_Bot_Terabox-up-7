@@ -1,6 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_read_progress::TokioAsyncReadProgressExt;
 use dashmap::{DashMap, DashSet};
 use futures::TryStreamExt;
@@ -14,7 +14,7 @@ use reqwest::Url;
 use scopeguard::defer;
 use serde_json::Value;
 use stream_cancel::{Trigger, Valved};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 
 use crate::command::{parse_command, Command};
@@ -29,23 +29,80 @@ pub struct Bot {
     locks: Arc<DashSet<i64>>,
     started_by: Arc<DashMap<i64, i64>>,
     triggers: Arc<DashMap<i64, Trigger>>,
+
+    // Queue for source-channel links
+    queue_tx: mpsc::Sender<String>,
+
+    // Configured source/destination (by id)
+    source_channel_id: Option<i64>,
+    destination_channel_id: Option<i64>,
+}
+
+// Very simple URL extractor: splits by whitespace and keeps http(s) tokens,
+// trimming common surrounding punctuation.
+fn extract_urls(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    for raw in text.split_whitespace() {
+        let token = raw.trim_matches(|c: char| matches!(
+            c,
+            ',' | ';' | '.' | ')' | '(' | ']' | '[' | '>' | '<' | '"' | '\''
+        ));
+        if token.starts_with("http://") || token.starts_with("https://") {
+            out.push(token);
+        }
+    }
+    out
 }
 
 impl Bot {
     /// Create a new bot instance.
-    pub async fn new(client: Client) -> Result<Arc<Self>> {
+pub async fn new(client: Client) -> Result<Arc<Self>> {
         let me = client.get_me().await?;
-        Ok(Arc::new(Self {
+
+        // Read optional channel ids from env
+        let source_channel_id = std::env::var("SOURCE_CHANNEL_ID")
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok());
+        let destination_channel_id = std::env::var("DESTINATION_CHANNEL_ID")
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok());
+
+        let (queue_tx, queue_rx) = mpsc::channel::<String>(200);
+
+        let bot = Arc::new(Self {
             client,
             me,
             http: reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
-            .build()?,
+                .connect_timeout(Duration::from_secs(10))
+                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
+                .build()?,
             locks: Arc::new(DashSet::new()),
             started_by: Arc::new(DashMap::new()),
             triggers: Arc::new(DashMap::new()),
-        }))
+            queue_tx,
+            source_channel_id,
+            destination_channel_id,
+        });
+
+        // Spawn queue worker if both ids are configured
+        if bot.source_channel_id.is_some() && bot.destination_channel_id.is_some() {
+            let bot_clone = bot.clone();
+            tokio::spawn(async move {
+                if let Err(e) = bot_clone.queue_worker(queue_rx).await {
+                    error!("Queue worker error: {}", e);
+                }
+            });
+            info!(
+                "Queue worker started (source: {:?}, destination: {:?})",
+                bot.source_channel_id, bot.destination_channel_id
+            );
+        } else {
+            info!(
+                "Queue worker disabled. Configure SOURCE_CHANNEL_ID and DESTINATION_CHANNEL_ID to enable."
+            );
+        }
+
+        Ok(bot)
     }
 
     /// Check if URL is from Terabox domain
@@ -132,7 +189,27 @@ impl Bot {
     ///
     /// Ensures the message is from a user or a group, and then parses the command.
     /// If the command is not recognized, it will try to parse the message as a URL.
-    async fn handle_message(&self, msg: Message) -> Result<()> {
+async fn handle_message(&self, msg: Message) -> Result<()> {
+        // Special handling: if a source channel is configured and this message is from that channel,
+        // extract links and enqueue them for processing to destination channel.
+        if let (Some(source_id), Some(_dest_id)) = (self.source_channel_id, self.destination_channel_id) {
+            if msg.chat().id() == source_id {
+                let text = msg.text();
+                let urls = extract_urls(text);
+                if urls.is_empty() {
+                    return Ok(());
+                }
+                info!("Enqueuing {} link(s) from source channel {}", urls.len(), source_id);
+                for url in urls {
+                    // Enqueue with backpressure so nothing is dropped
+                    if let Err(e) = self.queue_tx.send(url.to_string()).await {
+                        warn!("Queue closed, failed to enqueue url: {}", e);
+                    }
+                }
+                return Ok(());
+            }
+        }
+
         // Ensure the message chat is a user or a group
         match msg.chat() {
             Chat::User(_) | Chat::Group(_) => {}
@@ -225,8 +302,8 @@ impl Bot {
         self.handle_url(msg, url).await
     }
 
-    /// Handle a URL.
-    /// This function will download the file and upload it to Telegram.
+/// Handle a URL.
+    /// This function will download the file and upload it to the same chat as msg.
     async fn handle_url(&self, msg: Message, url: Url) -> Result<()> {
         let sender = match msg.sender() {
             Some(sender) => sender,
@@ -466,6 +543,8 @@ impl Bot {
 
     /// Handle the cancel button.
     async fn handle_cancel(&self, query: CallbackQuery) -> Result<()> {
+        // If the upload was initiated from channel-queue, there is no started_by entry.
+        // So we allow cancellation only for interactive (DM/group) uploads initiated by a user.
         let started_by_user_id = match self.started_by.get(&query.chat().id()) {
             Some(id) => *id,
             None => return Ok(()),
@@ -501,6 +580,249 @@ impl Bot {
 
             query.answer().send().await?;
         }
+        Ok(())
+    }
+
+    // Worker: process queued URLs and upload one-by-one to the destination channel
+    async fn queue_worker(self: Arc<Self>, mut rx: mpsc::Receiver<String>) -> Result<()> {
+        loop {
+            let Some(url_str) = rx.recv().await else { break; };
+
+            let dest_id = match self.destination_channel_id {
+                Some(id) => id,
+                None => {
+                    warn!("Destination channel not configured, dropping queued item");
+                    continue;
+                }
+            };
+
+            // Resolve destination Chat by scanning dialogs once per task (cheap enough)
+            let dest_chat = self
+                .resolve_chat_by_id(dest_id)
+                .await
+                .with_context(|| format!("Failed to resolve destination chat id {}", dest_id))?;
+
+            let url = match Url::parse(&url_str) {
+                Ok(u) => u,
+                Err(e) => {
+                    warn!("Invalid URL in queue: {} ({})", url_str, e);
+                    continue;
+                }
+            };
+
+            if let Err(e) = self.upload_url_to_chat(url, &dest_chat).await {
+                error!("Upload failed for {}: {}", url_str, e);
+            }
+        }
+        Ok(())
+    }
+
+    // Resolve a chat by id from bot's dialogs
+    async fn resolve_chat_by_id(&self, id: i64) -> Result<Chat> {
+        let mut dialogs = self.client.iter_dialogs();
+        loop {
+            match dialogs.next().await? {
+                Some(dialog) => {
+                    if dialog.chat().id() == id {
+                        return Ok(dialog.chat());
+                    }
+                }
+                None => break,
+            }
+        }
+        anyhow::bail!(
+            "Chat id {} not found in dialogs. Ensure the bot is a member/admin.",
+            id
+        )
+    }
+
+    // Core upload logic reused by queue worker (progress messages are posted in dest chat)
+    async fn upload_url_to_chat(&self, url: Url, dest_chat: &Chat) -> Result<()> {
+        // Check if it's a Terabox URL and get the proxy URL if needed
+        let download_url = if self.is_terabox_url(&url) {
+            info!("(Queue) Detected Terabox URL: {}", url);
+            match self.get_final_stream_link(url.as_str()).await {
+                Ok(Some(proxy_url)) => {
+                    info!("(Queue) Got proxy URL for Terabox: {}", proxy_url);
+                    Url::parse(&proxy_url).context("Failed to parse proxy URL")?
+                }
+                Ok(None) => {
+                    anyhow::bail!("Failed to get download link from Terabox (None)");
+                }
+                Err(err) => {
+                    return Err(err);
+                }
+            }
+        } else {
+            url
+        };
+
+        info!("(Queue) Downloading file from {}", download_url);
+        let response = self.http.get(download_url).send().await?;
+
+        // Get the file name and size
+        let length = response.content_length().unwrap_or_default() as usize;
+        let name = match response
+            .headers()
+            .get("content-disposition")
+            .and_then(|value| {
+                value
+                    .to_str()
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .split(';')
+                            .map(|value| value.trim())
+                            .find(|value| value.starts_with("filename="))
+                    })
+                    .map(|value| value.trim_start_matches("filename="))
+                    .map(|value| value.trim_matches('"'))
+            }) {
+            Some(name) => name.to_string(),
+            None => response
+                .url()
+                .path_segments()
+                .and_then(|segments| segments.last())
+                .and_then(|name| {
+                    if name.contains('.') {
+                        Some(name.to_string())
+                    } else {
+                        // guess the extension from the content type
+                        response
+                            .headers()
+                            .get("content-type")
+                            .and_then(|value| value.to_str().ok())
+                            .and_then(mime_guess::get_mime_extensions_str)
+                            .and_then(|ext| ext.first())
+                            .map(|ext| format!("{}.{}", name, ext))
+                    }
+                })
+                .unwrap_or("file.bin".to_string())
+                .to_string(),
+        };
+        let name = percent_encoding::percent_decode_str(&name)
+            .decode_utf8()?
+            .to_string();
+        let lower_name = name.to_lowercase();
+
+        // Check content type and file extension for video files
+        let content_type_is_video = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .map(|value| {
+                value.starts_with("video/") ||
+                value.contains("x-matroska") ||  // For MKV files
+                value.contains("quicktime")    // For MOV files
+            })
+            .unwrap_or(false);
+
+        let video_extensions = [
+            ".mp4", ".mkv", ".webm", ".avi", ".mov",
+            ".m4v", ".3gp", ".flv", ".wmv", ".ts"
+        ];
+
+        let is_video = content_type_is_video ||
+            video_extensions.iter().any(|ext| lower_name.ends_with(ext));
+
+        info!("(Queue) File {} ({} bytes, video: {})", name, length, is_video);
+
+        // File is empty
+        if length == 0 {
+            // Post a quick note to destination that the URL was empty
+            let _ = self
+                .client
+                .send_message(dest_chat, InputMessage::html("⚠️ File is empty"))
+                .await;
+            return Ok(());
+        }
+
+        // File is too large
+        if length > 2 * 1024 * 1024 * 1024 {
+            let _ = self
+                .client
+                .send_message(dest_chat, InputMessage::html("⚠️ File is too large"))
+                .await;
+            return Ok(());
+        }
+
+        // Wrap the response stream in a valved stream (no cancel button in queue mode)
+        let (_trigger, stream) = Valved::new(
+            response
+                .bytes_stream()
+                .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err)),
+        );
+
+        // Send status message in destination
+        let status = Arc::new(Mutex::new(
+            self
+                .client
+                .send_message(
+                    dest_chat,
+                    InputMessage::html(format!("🚀 Starting upload of <code>{}</code>...", name)),
+                )
+                .await?,
+        ));
+
+        // Setup progress reporter
+        let mut stream = stream
+            .into_async_read()
+            .compat()
+            // Report progress every 3 seconds
+            .report_progress(Duration::from_secs(3), |progress| {
+                let status = status.clone();
+                let name = name.clone();
+                tokio::spawn(async move {
+                    status
+                        .lock()
+                        .await
+                        .edit(InputMessage::html(format!(
+                            "⏳ Uploading <code>{}</code> <b>({:.2}%)</b>\n\
+                            <i>{} / {}</i>",
+                            name,
+                            progress as f64 / length as f64 * 100.0,
+                            bytesize::to_string(progress as u64, true),
+                            bytesize::to_string(length as u64, true),
+                        )))
+                        .await
+                        .ok();
+                });
+            });
+
+        // Upload the file
+        let start_time = chrono::Utc::now();
+        let file = self
+            .client
+            .upload_stream(&mut stream, length, name.clone())
+            .await?;
+
+        // Calculate upload time
+        let elapsed = chrono::Utc::now() - start_time;
+        info!("(Queue) Uploaded file {} ({} bytes) in {}", name, length, elapsed);
+
+        // Send file to destination
+        let caption = format!(
+            "Uploaded in <b>{:.2} secs</b>",
+            elapsed.num_milliseconds() as f64 / 1000.0
+        );
+
+        let mut input_msg = InputMessage::html(caption);
+        if is_video {
+            input_msg = input_msg.document(file).attribute(grammers_client::types::Attribute::Video {
+                supports_streaming: true,
+                duration: Duration::ZERO,
+                w: 0,
+                h: 0,
+                round_message: false,
+            });
+        } else {
+            input_msg = input_msg.document(file);
+        };
+        self.client.send_message(dest_chat, input_msg).await?;
+
+        // Delete status message
+        status.lock().await.delete().await?;
+
         Ok(())
     }
 }
