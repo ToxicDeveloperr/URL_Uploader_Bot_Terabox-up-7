@@ -328,22 +328,27 @@ impl Bot {
             .decode_utf8()?
             .to_string();
         let lower_name = name.to_lowercase();
-        let is_video = response
+        
+        // Check content type and file extension for video files
+        let content_type_is_video = response
             .headers()
             .get("content-type")
+            .and_then(|value| value.to_str().ok())
             .map(|value| {
-                value
-                    .to_str()
-                    .ok()
-                    .map(|value| value.starts_with("video/"))
-                    .unwrap_or_default()
+                value.starts_with("video/") || 
+                value.contains("x-matroska") ||  // For MKV files
+                value.contains("quicktime")    // For MOV files
             })
-            .unwrap_or_default()
-            || lower_name.ends_with(".mp4")
-            || lower_name.ends_with(".mkv")
-            || lower_name.ends_with(".webm")
-            || lower_name.ends_with(".avi")
-            || lower_name.ends_with(".mov");
+            .unwrap_or(false);
+            
+        let video_extensions = [
+            ".mp4", ".mkv", ".webm", ".avi", ".mov", 
+            ".m4v", ".3gp", ".flv", ".wmv", ".ts"
+        ];
+        
+        let is_video = content_type_is_video || 
+            video_extensions.iter().any(|ext| lower_name.ends_with(ext));
+            
         info!("File {} ({} bytes, video: {})", name, length, is_video);
 
         // File is empty
@@ -433,7 +438,13 @@ impl Bot {
 
         let mut input_msg = InputMessage::html(caption);
         if is_video {
-            input_msg = input_msg.video(file, false, Duration::ZERO, 0, 0);
+            input_msg = input_msg.document(file).attribute(grammers_client::types::Attribute::Video {
+                supports_streaming: true,
+                duration: Duration::ZERO,
+                w: 0,
+                h: 0,
+                round_message: false,
+            });
         } else {
             input_msg = input_msg.document(file);
         };
