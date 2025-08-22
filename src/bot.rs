@@ -430,10 +430,12 @@ impl Bot {
             "Uploaded in <b>{:.2} secs</b>",
             elapsed.num_milliseconds() as f64 / 1000.0
         );
-        let input_msg = if is_video {
-            InputMessage::video(file).caption(caption)
+
+        let mut input_msg = InputMessage::html(caption);
+        if is_video {
+            input_msg = input_msg.video(file, false, Duration::ZERO, 0, 0);
         } else {
-            InputMessage::document(file).caption(caption)
+            input_msg = input_msg.document(file);
         };
         msg.reply(input_msg).await?;
 
