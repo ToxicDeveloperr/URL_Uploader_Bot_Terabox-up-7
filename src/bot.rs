@@ -54,18 +54,30 @@ fn extract_urls(text: &str) -> Vec<&str> {
     out
 }
 
+/// Convert Bot API-style channel/supergroup id (-100xxxxxxxxxxxx) to MTProto internal id (xxxxxxxxxxxx)
+fn normalize_chat_id(id: i64) -> i64 {
+    // If it's like -1001234567890, convert to 1234567890
+    if id <= -1_000_000_000_000 {
+        (id.abs() - 1_000_000_000_000) as i64
+    } else {
+        id
+    }
+}
+
 impl Bot {
     /// Create a new bot instance.
 pub async fn new(client: Client) -> Result<Arc<Self>> {
         let me = client.get_me().await?;
 
-        // Read optional channel ids from env
+        // Read optional channel ids from env and normalize if they are in Bot API format (-100...)
         let source_channel_id = std::env::var("SOURCE_CHANNEL_ID")
             .ok()
-            .and_then(|s| s.parse::<i64>().ok());
+            .and_then(|s| s.parse::<i64>().ok())
+            .map(normalize_chat_id);
         let destination_channel_id = std::env::var("DESTINATION_CHANNEL_ID")
             .ok()
-            .and_then(|s| s.parse::<i64>().ok());
+            .and_then(|s| s.parse::<i64>().ok())
+            .map(normalize_chat_id);
 
         let (queue_tx, queue_rx) = mpsc::channel::<String>(200);
 
@@ -86,6 +98,10 @@ pub async fn new(client: Client) -> Result<Arc<Self>> {
 
         // Spawn queue worker if both ids are configured
         if bot.source_channel_id.is_some() && bot.destination_channel_id.is_some() {
+            info!(
+                "Normalized channel ids -> source: {:?}, destination: {:?}",
+                bot.source_channel_id, bot.destination_channel_id
+            );
             let bot_clone = bot.clone();
             tokio::spawn(async move {
                 if let Err(e) = bot_clone.queue_worker(queue_rx).await {
