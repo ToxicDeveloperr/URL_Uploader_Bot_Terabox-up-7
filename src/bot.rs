@@ -694,23 +694,16 @@ async fn handle_message(&self, msg: Message) -> Result<()> {
         // Second, try resolving by username if provided
         if let Some(username) = &self.destination_channel_username {
             match self.client.resolve_username(username).await? {
-                Some(resolved) => {
-                    match resolved {
-                        grammers_client::types::UsernameResolution::User(_) => {
-                            anyhow::bail!("Resolved username @{} to a user, not a channel/group", username)
-                        }
-                        grammers_client::types::UsernameResolution::Chat(chat) => {
-                            // Cache and return if ids match or if we don't care about id strictly
-                            self.known_chats.insert(chat.id(), chat.clone());
-                            if chat.id() != id {
-                                warn!(
-                                    "Resolved @{} to chat id {}, but DESTINATION_CHANNEL_ID is {}. Using resolved chat.",
-                                    username, chat.id(), id
-                                );
-                            }
-                            return Ok(chat);
-                        }
+                Some(chat) => {
+                    // Cache and return
+                    self.known_chats.insert(chat.id(), chat.clone());
+                    if chat.id() != id {
+                        warn!(
+                            "Resolved @{} to chat id {}, but DESTINATION_CHANNEL_ID is {}. Using resolved chat.",
+                            username, chat.id(), id
+                        );
                     }
+                    return Ok(chat);
                 }
                 None => {
                     warn!("Could not resolve username @{} yet", username);
