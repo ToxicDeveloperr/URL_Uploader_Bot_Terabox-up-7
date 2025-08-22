@@ -190,6 +190,14 @@ pub async fn new(client: Client) -> Result<Arc<Self>> {
     /// Ensures the message is from a user or a group, and then parses the command.
     /// If the command is not recognized, it will try to parse the message as a URL.
 async fn handle_message(&self, msg: Message) -> Result<()> {
+        // Basic visibility: log every new message with chat kind
+        let kind = match msg.chat() {
+            Chat::User(_) => "user",
+            Chat::Group(_) => "group",
+            _ => "other",
+        };
+        info!("New message in chat {} (kind: {})", msg.chat().id(), kind);
+
         // Special handling: if a source channel is configured and this message is from that channel,
         // extract links and enqueue them for processing to destination channel.
         if let (Some(source_id), Some(_dest_id)) = (self.source_channel_id, self.destination_channel_id) {
@@ -197,6 +205,7 @@ async fn handle_message(&self, msg: Message) -> Result<()> {
                 let text = msg.text();
                 let urls = extract_urls(text);
                 if urls.is_empty() {
+                    info!("No URLs found in source channel message");
                     return Ok(());
                 }
                 info!("Enqueuing {} link(s) from source channel {}", urls.len(), source_id);
@@ -207,6 +216,12 @@ async fn handle_message(&self, msg: Message) -> Result<()> {
                     }
                 }
                 return Ok(());
+            } else if !matches!(msg.chat(), Chat::User(_) | Chat::Group(_)) {
+                // If it's a channel/similar but ID doesn't match, log the observed ID for debug
+                info!(
+                    "Ignoring non-source channel message. Observed chat id: {} (configure this as SOURCE_CHANNEL_ID if this is your source)",
+                    msg.chat().id()
+                );
             }
         }
 
