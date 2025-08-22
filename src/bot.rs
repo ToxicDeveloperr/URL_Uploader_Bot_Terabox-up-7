@@ -327,6 +327,7 @@ impl Bot {
         let name = percent_encoding::percent_decode_str(&name)
             .decode_utf8()?
             .to_string();
+        let lower_name = name.to_lowercase();
         let is_video = response
             .headers()
             .get("content-type")
@@ -334,11 +335,15 @@ impl Bot {
                 value
                     .to_str()
                     .ok()
-                    .map(|value| value.starts_with("video/mp4"))
+                    .map(|value| value.starts_with("video/"))
                     .unwrap_or_default()
             })
             .unwrap_or_default()
-            || name.to_lowercase().ends_with(".mp4");
+            || lower_name.ends_with(".mp4")
+            || lower_name.ends_with(".mkv")
+            || lower_name.ends_with(".webm")
+            || lower_name.ends_with(".avi")
+            || lower_name.ends_with(".mov");
         info!("File {} ({} bytes, video: {})", name, length, is_video);
 
         // File is empty
@@ -425,15 +430,10 @@ impl Bot {
             "Uploaded in <b>{:.2} secs</b>",
             elapsed.num_milliseconds() as f64 / 1000.0
         ));
-        input_msg = input_msg.document(file);
         if is_video {
-            input_msg = input_msg.attribute(grammers_client::types::Attribute::Video {
-                supports_streaming: true,
-                duration: Duration::ZERO,
-                w: 0,
-                h: 0,
-                round_message: false,
-            });
+            input_msg = input_msg.video(file).caption(input_msg.text().to_string());
+        } else {
+            input_msg = input_msg.document(file);
         }
         msg.reply(input_msg).await?;
 
